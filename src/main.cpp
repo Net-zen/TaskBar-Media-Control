@@ -146,6 +146,12 @@ struct Marquee {
     int travel = 0; // how far it slides: stripW minus the view's width
 };
 
+struct MarqueeFrame {
+    ULONGLONG elapsed;
+    bool running;
+    UINT dpi;
+};
+
 enum class Redraw {
     Full,    // something real changed: redraw everything
     Seekbar, // the bar moved a pixel: reuse the static parts
@@ -206,11 +212,13 @@ struct State {
     bool marqueeRunning = false;
     size_t presentedBytes = 0;      // size of the frame on screen; 0 = the bitmap was recreated since
 
-    // Track-change cross-fade: from the frame that was on screen to the new one.
+    // Track-change cross-fade: save the old frame, then reconstruct the new
+    // one from basePixels and the frozen marquee phase on each tick.
     bool fadeNext = false;          // the next full redraw should fade in
     bool fading = false;
     ULONGLONG fadeStart = 0;
-    std::vector<BYTE> fadeFrom, fadeTo;
+    MarqueeFrame fadeMarquee{};
+    std::vector<BYTE> fadeBuffer;
 
     std::array<LONG, 5> geoSignature{}; // what the last taskbar read found, to tell when it has settled
     int geoSettleReads = 0;             // reads in a row that found something new
@@ -275,7 +283,10 @@ bool ReadLightTheme() {
 // Drawing: Direct2D in software mode into a DIB, handed to the window with
 // UpdateLayeredWindow for per-pixel alpha. No GPU device, no swap chain.
 
+void StopFade();
+
 void FreeBitmap() {
+    StopFade();
     if (g.memDC) {
         if (g.oldBitmap) SelectObject(g.memDC, g.oldBitmap);
         DeleteDC(g.memDC);
@@ -617,8 +628,8 @@ void BuildMarquees() {
 
 // Back and forth: rest, slide to the end, rest, slide back. Also reports how
 // long until the next frame is needed (0 = it's sliding, so draw soon).
-int MarqueeOffset(const Marquee& m, ULONGLONG elapsed, ULONGLONG* wait) {
-    const double pxPerMs = Scale(kMarqueeSpeed) / 1000.0;
+int MarqueeOffset(const Marquee& m, ULONGLONG elapsed, UINT dpi, ULONGLONG* wait) {
+    const double pxPerMs = MulDiv(kMarqueeSpeed, static_cast<int>(dpi), 96) / 1000.0;
     const ULONGLONG slide = static_cast<ULONGLONG>(m.travel / pxPerMs);
     ULONGLONG t = elapsed % (2 * (kMarqueePauseMs + slide));
     *wait = 0;
@@ -656,14 +667,13 @@ uint32_t Faded(uint32_t s, int coverage /* 0..256 */) {
 
 // Copies each strip into the frame at its current offset, fading the edge
 // where the text continues out of view.
-void BlendMarquees() {
+void BlendMarquees(MarqueeFrame phase) {
     auto* frame = static_cast<uint32_t*>(g.dibBits);
     const int stride = g.bitmapSize.cx;
-    const int fade = std::max(1, Scale(kMarqueeFade));
-    const ULONGLONG elapsed = GetTickCount64() - g.marqueeStart;
+    const int fade = std::max(1, MulDiv(kMarqueeFade, static_cast<int>(phase.dpi), 96));
     for (const auto& m : g.marquees) {
         ULONGLONG wait;
-        const int offset = g.marqueeRunning ? MarqueeOffset(m, elapsed, &wait) : 0;
+        const int offset = phase.running ? MarqueeOffset(m, phase.elapsed, phase.dpi, &wait) : 0;
         const int viewW = m.view.right - m.view.left;
         for (int y = 0; y < m.stripH; ++y) {
             const int fy = m.view.top + y;
@@ -700,7 +710,7 @@ void ScheduleMarquee() {
     const ULONGLONG elapsed = GetTickCount64() - g.marqueeStart;
     for (const auto& m : g.marquees) {
         ULONGLONG wait;
-        MarqueeOffset(m, elapsed, &wait);
+        MarqueeOffset(m, elapsed, g.dpi, &wait);
         next = std::min(next, wait == 0 ? kMarqueeFrameMs : wait);
     }
     SetTimer(g.controller, kTimerMarquee, static_cast<UINT>(std::max<ULONGLONG>(next, kMarqueeFrameMs)), nullptr);
@@ -752,21 +762,24 @@ bool AnimationsEnabled() {
 void StopFade() {
     if (g.fading) KillTimer(g.controller, kTimerFade);
     g.fading = false;
+    // Don't retain a full-frame allocation between track changes.
+    std::vector<BYTE>().swap(g.fadeBuffer);
 }
 
 // One step of the cross-fade: a straight blend of the two frames' pixels,
 // eased so it starts and ends gently.
 void FadeTick() {
-    const size_t bytes = g.fadeTo.size();
+    const size_t bytes = g.fadeBuffer.size();
     auto* bits = static_cast<BYTE*>(g.dibBits);
-    if (!g.fading || !g.widget || !bits || g.fadeFrom.size() != bytes ||
+    if (!g.fading || !g.widget || !IsWindowVisible(g.widget) || !bits || g.basePixels.size() != bytes ||
         bytes != static_cast<size_t>(g.bitmapSize.cx) * g.bitmapSize.cy * 4) {
         StopFade();
         return;
     }
+    memcpy(bits, g.basePixels.data(), bytes);
+    BlendMarquees(g.fadeMarquee);
     double t = static_cast<double>(GetTickCount64() - g.fadeStart) / kFadeMs;
-    if (t >= 1) {
-        memcpy(bits, g.fadeTo.data(), bytes);
+    if (t >= 1 || !SetTimer(g.controller, kTimerFade, kFadeFrameMs, nullptr)) {
         Present();
         StopFade();
         ScheduleMarquee();
@@ -775,8 +788,8 @@ void FadeTick() {
     t = t * t * (3 - 2 * t);
     const int weight = static_cast<int>(t * 256);
     for (size_t i = 0; i < bytes; ++i) {
-        const int from = g.fadeFrom[i];
-        bits[i] = static_cast<BYTE>(from + (((g.fadeTo[i] - from) * weight) >> 8));
+        const int from = g.fadeBuffer[i];
+        bits[i] = static_cast<BYTE>(from + (((bits[i] - from) * weight) >> 8));
     }
     Present();
 }
@@ -805,13 +818,13 @@ void Render(Redraw what = Redraw::Full) {
     // The bitmap still holds what's on screen, which is where a fade starts from.
     const bool startFade = g.fadeNext && what == Redraw::Full && g.presentedBytes == bytes && AnimationsEnabled();
     g.fadeNext = false;
-    if (startFade) g.fadeFrom.assign(bits, bits + bytes);
     if (what == Redraw::Marquee && g.basePixels.size() != bytes) what = Redraw::Seekbar;
     const Redraw measured = what;
 
     HRESULT hr = S_OK;
     if (what == Redraw::Full) {
         if (FAILED(g.target->BindDC(g.memDC, &bounds))) return;
+        if (startFade) g.fadeBuffer.assign(bits, bits + bytes);
         g.target->BeginDraw();
         DrawStatic(layout, h);
         hr = g.target->EndDraw();
@@ -832,25 +845,32 @@ void Render(Redraw what = Redraw::Full) {
     } else if (what == Redraw::Marquee) {
         memcpy(bits, g.basePixels.data(), bytes);
     }
-    if (hr == D2DERR_RECREATE_TARGET) {
-        // These belong to the target; rebuild them on the next draw.
-        g.target.Reset();
-        g.artBitmap.Reset();
-        g.artBitmapSource = nullptr;
-        g.iconBitmap.Reset();
-        g.iconBitmapSource = nullptr;
+    if (FAILED(hr)) {
+        StopFade();
+        if (hr == D2DERR_RECREATE_TARGET) {
+            // These belong to the target; rebuild them on the next draw.
+            g.target.Reset();
+            g.artBitmap.Reset();
+            g.artBitmapSource = nullptr;
+            g.iconBitmap.Reset();
+            g.iconBitmapSource = nullptr;
+        }
         g.staticPixels.clear();
         g.basePixels.clear();
+        g.presentedBytes = 0;
         return;
     }
-    BlendMarquees();
-    if (startFade) {
-        // Keep the old frame up; FadeTick blends it into this new one.
-        g.fadeTo.assign(bits, bits + bytes);
-        memcpy(bits, g.fadeFrom.data(), bytes);
+    const ULONGLONG now = GetTickCount64();
+    const MarqueeFrame phase{now - g.marqueeStart, g.marqueeRunning, g.dpi};
+    if (startFade && SetTimer(g.controller, kTimerFade, kFadeFrameMs, nullptr)) {
+        // Keep the old frame up until FadeTick reconstructs the new one.
+        memcpy(bits, g.fadeBuffer.data(), bytes);
         g.fading = true;
-        g.fadeStart = GetTickCount64();
-        SetTimer(g.controller, kTimerFade, kFadeFrameMs, nullptr);
+        g.fadeStart = now;
+        g.fadeMarquee = phase;
+    } else {
+        if (startFade) StopFade();
+        BlendMarquees(phase);
     }
 
     QueryPerformanceCounter(&t1);
@@ -972,6 +992,7 @@ void UpdateVisibility() {
         ShowWindow(g.widget, show ? SW_SHOWNA : SW_HIDE);
         Log(show ? L"Shown" : L"Hidden: %s", hiddenBecause);
         if (show) Render();
+        else StopFade();
     }
     ScheduleProgress();
     ScheduleMarquee();
@@ -1579,6 +1600,7 @@ LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Explorer went away and took our window with it. TaskbarCreated
             // normally brings us back; the retry covers a missed broadcast.
             Log(L"Widget destroyed");
+            StopFade();
             g.widget = nullptr;
             g.taskbar = nullptr;
             g.placed = {};
@@ -1649,7 +1671,6 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == kTimerMarquee) {
             OnMarqueeTick();
         } else if (wp == kTimerFade) {
-            SetTimer(hwnd, kTimerFade, kFadeFrameMs, nullptr); // FadeTick stops it when done
             FadeTick();
         } else if (wp == kTimerNoMedia) {
             g.noMediaPending = false;
