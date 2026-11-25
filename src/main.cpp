@@ -43,6 +43,7 @@ enum : UINT {
     WM_APP_TASKBAR_CHANGED,       // UIA says the layout moved; re-read soon
     WM_APP_MEDIA,                 // what's playing changed
     WM_APP_APPBAR,                // shell notifications (full screen apps)
+    WM_APP_TASKBAR_COLOR,          // sampled taskbar background changed contrast mode
 };
 enum : UINT_PTR {
     kTimerRelayout = 1,
@@ -91,9 +92,7 @@ constexpr UINT kFadeFrameMs = 15;       // only while a fade is running
 constexpr int kPreferredWidth = 300;   // all sizes in DIPs (96 DPI pixels)
 constexpr int kMinWidth = 160;
 constexpr int kMargin = 8;
-constexpr int kVerticalInset = 4;
-constexpr int kCornerRadius = 6;
-constexpr int kInnerPadding = 4;       // box edge to art and buttons
+constexpr int kInnerPadding = 2;       // small breathing room around cover art
 constexpr int kGap = 8;                // art to text, text to buttons
 constexpr int kButtonWidth = 28;
 constexpr int kSwitchButtonWidth = 16; // the small "more apps" chevron
@@ -105,7 +104,7 @@ constexpr UINT kMarqueeFrameMs = 33;   // ~30 fps, only while text is actually m
 constexpr int kMarqueeFade = 12;       // DIPs of fade where text runs past the edge
 constexpr float kTitleFontSize = 12.0f;
 constexpr float kArtistFontSize = 11.0f;
-constexpr float kIconFontSize = 14.0f;
+constexpr float kIconFontSize = 16.0f;
 constexpr float kSwitchIconFontSize = 10.0f;
 
 // Segoe Fluent Icons code points.
@@ -205,9 +204,6 @@ struct State {
     std::wstring marqueeKey;        // the scrolling texts; a change restarts the cycle
     ULONGLONG marqueeStart = 0;
     bool marqueeRunning = false;
-    ComPtr<ID2D1RoundedRectangleGeometry> boxClip;
-    D2D1_SIZE_F boxClipSize{};
-    ComPtr<ID2D1Layer> clipLayer;
     size_t presentedBytes = 0;      // size of the frame on screen; 0 = the bitmap was recreated since
 
     // Track-change cross-fade: from the frame that was on screen to the new one.
@@ -221,6 +217,9 @@ struct State {
     RECT placed{}; // widget rect, relative to the taskbar
     UINT dpi = 96;
     bool lightTheme = false;
+    bool taskbarBackgroundLight = false;
+    bool taskbarBackgroundKnown = false;
+    bool taskbarInkNeedsSample = true;
 
     FILE* log = nullptr;
     unsigned layoutEvents = 0;
@@ -384,7 +383,7 @@ WidgetLayout ComputeLayout(float w, float h) {
     layout.art = D2D1::RectF(pad, pad, pad + (h - 2 * pad), h - pad);
     float x = w - pad - total;
     for (int i = 0; i < shown; ++i) {
-        layout.buttons[i] = D2D1::RectF(x, pad, x + widthOf(i), h - pad);
+        layout.buttons[i] = D2D1::RectF(x, 0, x + widthOf(i), h);
         x += widthOf(i);
     }
     layout.text = D2D1::RectF(layout.art.right + gap, 0, layout.buttons[0].left - gap / 2, h);
@@ -437,7 +436,8 @@ ID2D1Bitmap* ArtBitmap() { return Uploaded(g.nowPlaying.art, g.artBitmap, g.artB
 ID2D1Bitmap* IconBitmap() { return Uploaded(g.nowPlaying.appIcon, g.iconBitmap, g.iconBitmapSource); }
 
 D2D1_COLOR_F InkAt(float alpha) {
-    return g.lightTheme ? D2D1::ColorF(0, 0, 0, alpha) : D2D1::ColorF(1, 1, 1, alpha);
+    const bool lightBackground = g.taskbarBackgroundKnown ? g.taskbarBackgroundLight : g.lightTheme;
+    return lightBackground ? D2D1::ColorF(0, 0, 0, alpha) : D2D1::ColorF(1, 1, 1, alpha);
 }
 
 // Draws a line of text that fits. One that doesn't is left out and queued in
@@ -458,22 +458,18 @@ void DrawLine(const std::wstring& text, IDWriteTextFormat* format, D2D1_RECT_F r
 }
 
 // Box, art, text and buttons: everything except the seekbar.
-void DrawStatic(const WidgetLayout& layout, float w, float h) {
+void DrawStatic(const WidgetLayout& layout, float h) {
     const MediaInfo& media = g.nowPlaying;
     // Paused media is drawn dimmer so the state reads at a glance.
     const float textAlpha = media.playing ? 0.92f : 0.6f;
-    ComPtr<ID2D1SolidColorBrush> fill, border, titleInk, artistInk, paint;
-    g.target->CreateSolidColorBrush(InkAt(PopupIsOpen() ? 0.14f : 0.08f), &fill); // "selected" while open
-    g.target->CreateSolidColorBrush(InkAt(0.12f), &border);
+    ComPtr<ID2D1SolidColorBrush> fill, titleInk, artistInk, paint;
+    // Only the no-art fallback gets a faint backing; the widget itself is transparent.
+    g.target->CreateSolidColorBrush(InkAt(0.08f), &fill);
     g.target->CreateSolidColorBrush(InkAt(textAlpha), &titleInk);
     g.target->CreateSolidColorBrush(InkAt(textAlpha * 0.7f), &artistInk);
     g.target->CreateSolidColorBrush(InkAt(1.0f), &paint); // recolored per use
 
     g.target->Clear(D2D1::ColorF(0, 0, 0, 0));
-    const float radius = static_cast<float>(Scale(kCornerRadius));
-    auto box = D2D1::RoundedRect(D2D1::RectF(0.5f, 0.5f, w - 0.5f, h - 0.5f), radius, radius);
-    g.target->FillRoundedRectangle(box, fill.Get());
-    g.target->DrawRoundedRectangle(box, border.Get(), 1.0f);
 
     // Cover art with rounded corners, or a music note when the app sends none.
     const float artRadius = static_cast<float>(Scale(kArtRadius));
@@ -542,7 +538,8 @@ D2D1_COLOR_F SeekbarColor(const MediaInfo& media) {
     const float alpha = media.playing ? 1.0f : 0.65f;
     if (!g.settings.artColorSeekbar || !media.hasAccent) return InkAt(alpha);
     const float s = std::clamp(media.accentSaturation * 1.1f, 0.45f, 0.85f);
-    const float v = g.lightTheme ? 0.55f : 0.95f;
+    const bool lightBackground = g.taskbarBackgroundKnown ? g.taskbarBackgroundLight : g.lightTheme;
+    const float v = lightBackground ? 0.55f : 0.95f;
     const float h = media.accentHue / 60.0f;
     const float c = v * s, x = c * (1 - std::abs(std::fmod(h, 2.0f) - 1)), m = v - c;
     float r = 0, gr = 0, b = 0;
@@ -557,25 +554,14 @@ D2D1_COLOR_F SeekbarColor(const MediaInfo& media) {
     return D2D1::ColorF(r + m, gr + m, b + m, alpha);
 }
 
-// Seekbar along the bottom edge, clipped to the box's rounded outline so its
-// ends follow the corner curves. Display only. The filled part is at full
-// brightness so it reads at a glance against the faint track.
-void DrawSeekbar(const WidgetLayout& layout, float w, float h) {
+// A thin playback indicator on the very bottom edge, like a taskbar app marker.
+void DrawSeekbar(const WidgetLayout& layout) {
     const MediaInfo& media = g.nowPlaying;
-    if (!media.hasTimeline) return;
-    if (!g.boxClip || g.boxClipSize.width != w || g.boxClipSize.height != h) {
-        const float radius = static_cast<float>(Scale(kCornerRadius));
-        g.boxClip.Reset();
-        g.d2d->CreateRoundedRectangleGeometry(D2D1::RoundedRect(D2D1::RectF(0, 0, w, h), radius, radius),
-                                              &g.boxClip);
-        g.boxClipSize = D2D1::SizeF(w, h);
-    }
-    if (!g.clipLayer) g.target->CreateLayer(&g.clipLayer);
+    if (!media.hasTimeline || media.durationMs <= 0) return;
     ComPtr<ID2D1SolidColorBrush> paint;
     g.target->CreateSolidColorBrush(InkAt(0.18f), &paint);
-    if (!g.boxClip || !g.clipLayer || !paint) return;
+    if (!paint) return;
 
-    g.target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), g.boxClip.Get()), g.clipLayer.Get());
     const auto& track = layout.seekbar;
     g.target->FillRectangle(track, paint.Get());
     auto filled = track;
@@ -583,7 +569,6 @@ void DrawSeekbar(const WidgetLayout& layout, float w, float h) {
     filled.right = track.left + (track.right - track.left) * progress;
     paint->SetColor(SeekbarColor(media));
     g.target->FillRectangle(filled, paint.Get());
-    g.target->PopLayer();
 }
 
 // Renders each overflowing line once into its own strip of pixels.
@@ -721,6 +706,30 @@ void ScheduleMarquee() {
     SetTimer(g.controller, kTimerMarquee, static_cast<UINT>(std::max<ULONGLONG>(next, kMarqueeFrameMs)), nullptr);
 }
 
+void SampleTaskbarBackground() {
+    if (!g.taskbarInkNeedsSample || !g.widget || !IsWindowVisible(g.widget)) return;
+    RECT widget{};
+    if (!GetWindowRect(g.widget, &widget) || widget.right - widget.left < 4 || widget.bottom <= widget.top) return;
+
+    // The first two pixels at the left edge are deliberately transparent (cover art starts inset).
+    // Reading the composed desktop there gives the actual taskbar material/tint, including acrylic.
+    HDC screen = GetDC(nullptr);
+    if (!screen) return;
+    const int x = widget.left + 1;
+    const int y = widget.top + (widget.bottom - widget.top) / 2;
+    const COLORREF pixel = GetPixel(screen, x, y);
+    ReleaseDC(nullptr, screen);
+    if (pixel == CLR_INVALID) return;
+
+    const int luminance = (299 * GetRValue(pixel) + 587 * GetGValue(pixel) + 114 * GetBValue(pixel)) / 1000;
+    const bool light = luminance >= 145;
+    const bool previous = g.taskbarBackgroundKnown ? g.taskbarBackgroundLight : g.lightTheme;
+    g.taskbarBackgroundLight = light;
+    g.taskbarBackgroundKnown = true;
+    g.taskbarInkNeedsSample = false;
+    if (light != previous && g.controller) PostMessageW(g.controller, WM_APP_TASKBAR_COLOR, 0, 0);
+}
+
 // Hands the bitmap to Windows as the widget's new look.
 void Present() {
     POINT source{0, 0};
@@ -730,6 +739,7 @@ void Present() {
         Log(L"UpdateLayeredWindow failed: %lu", GetLastError());
     }
     g.presentedBytes = static_cast<size_t>(size.cx) * size.cy * 4;
+    SampleTaskbarBackground();
 }
 
 // Windows' "Animation effects" setting.
@@ -803,7 +813,7 @@ void Render(Redraw what = Redraw::Full) {
     if (what == Redraw::Full) {
         if (FAILED(g.target->BindDC(g.memDC, &bounds))) return;
         g.target->BeginDraw();
-        DrawStatic(layout, w, h);
+        DrawStatic(layout, h);
         hr = g.target->EndDraw();
         GdiFlush();
         g.staticPixels.assign(bits, bits + bytes);
@@ -814,7 +824,7 @@ void Render(Redraw what = Redraw::Full) {
     if (SUCCEEDED(hr) && what != Redraw::Marquee) {
         if (g.nowPlaying.hasTimeline && SUCCEEDED(g.target->BindDC(g.memDC, &bounds))) {
             g.target->BeginDraw();
-            DrawSeekbar(layout, w, h);
+            DrawSeekbar(layout);
             hr = g.target->EndDraw();
             GdiFlush();
         }
@@ -825,7 +835,6 @@ void Render(Redraw what = Redraw::Full) {
     if (hr == D2DERR_RECREATE_TARGET) {
         // These belong to the target; rebuild them on the next draw.
         g.target.Reset();
-        g.clipLayer.Reset();
         g.artBitmap.Reset();
         g.artBitmapSource = nullptr;
         g.iconBitmap.Reset();
@@ -1028,9 +1037,9 @@ void ApplyGeometry() {
     const int width = place.width;
     const int available = place.available;
 
-    int barHeight = bar.bottom - bar.top;
-    int height = barHeight - 2 * Scale(kVerticalInset);
-    RECT next{place.left - bar.left, (barHeight - height) / 2, 0, 0};
+    const int barHeight = bar.bottom - bar.top;
+    const int height = barHeight;
+    RECT next{place.left - bar.left, 0, 0, barHeight};
     next.right = next.left + width;
     next.bottom = next.top + height;
 
@@ -1040,6 +1049,7 @@ void ApplyGeometry() {
     g.fits = true;
     if (!EqualRect(&next, &g.placed)) {
         g.placed = next;
+        g.taskbarInkNeedsSample = true;
         SetWindowPos(g.widget, HWND_TOP, next.left, next.top, width, height, SWP_NOACTIVATE);
         Log(L"Placed %s at x=%ld w=%d h=%d (free %d px, Start at %ld)",
             place.rightOfIcons ? L"right of the icons" : L"left of the icons", next.left, width, height, available,
@@ -1612,6 +1622,9 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_GEOMETRY:
         ApplyGeometry();
         return 0;
+    case WM_APP_TASKBAR_COLOR:
+        Render(); // redraw text and controls with the sampled taskbar contrast
+        return 0;
     case WM_APP_MEDIA:
         if (wp) {
             Log(L"Media error 0x%08lX; the media thread carries on", static_cast<unsigned long>(lp));
@@ -1652,6 +1665,7 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_SETTINGCHANGE:
+        g.taskbarInkNeedsSample = true;
         if (lp && wcscmp(reinterpret_cast<const wchar_t*>(lp), L"ImmersiveColorSet") == 0) {
             bool light = ReadLightTheme();
             if (light != g.lightTheme) {
@@ -1659,12 +1673,14 @@ LRESULT CALLBACK ControllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 Log(L"Theme changed: %s", light ? L"light" : L"dark");
                 ClosePopup(); // its backdrop and colors were set for the old theme
                 SettingsWindowRefresh();
-                Render();
             }
         }
+        Render(); // refresh transparent content and re-sample taskbar tint
         ScheduleRelayout(); // taskbar alignment or Widgets may have changed
         return 0;
     case WM_DISPLAYCHANGE:
+        g.taskbarInkNeedsSample = true;
+        Render();
         ScheduleRelayout();
         return 0;
     case WM_DESTROY:
