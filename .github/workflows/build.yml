@@ -1,0 +1,51 @@
+name: Build TaskbarMedia
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: taskbarmedia-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64 / Release
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Configure CMake
+        run: cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          $exe = "build/Release/TaskbarMedia.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Build output not found: $exe"
+          }
+          Get-Item $exe | Format-List FullName, Length, LastWriteTime
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: TaskbarMedia-windows-x64
+          path: build/Release/TaskbarMedia.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
